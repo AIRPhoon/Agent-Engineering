@@ -17,8 +17,17 @@ export interface FinanceReason {
     explanation: string;
 }
 /** narrow 只提出较小的成果文件范围，保留原目标，交报送方整理必要上下文后重新申请。 */
+export declare const DECISIONS: readonly ['allow', 'narrow', 'block', 'needs-information'];
+export type FinanceVerdict = (typeof DECISIONS)[number];
+/**
+ * 判断任意值是否为允许的财务结论。
+ * 财务解析与持久化记录校验共用这一份列表。
+ * @param value 待判断的未知值。
+ * @returns 是合法结论时为 true，并收窄类型。
+ */
+export declare function isDecision(value: unknown): value is FinanceVerdict;
 export interface FinanceReport {
-    decision: 'allow' | 'narrow' | 'block' | 'needs-information';
+    decision: FinanceVerdict;
     summary: string;
     reasons: FinanceReason[];
     proposedFiles: string[];

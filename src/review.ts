@@ -1,9 +1,36 @@
 /** 检查的数据及 JSON 入口；由插件和离线流程测试共同使用。 */
 import type { ObjectJsonSchema } from '@deepseek-ai/dsh-tools';
 
+/** 检查对象的两种类型；路由与持久化结构校验共用。 */
+export const KINDS = ['function', 'module'] as const;
+export type ReviewKind = (typeof KINDS)[number];
+
+/** 检查结论的允许取值；报告解析与持久化结构校验共用，避免两处枚举漂移。 */
+export const VERDICTS = ['pass', 'changes-required', 'inconclusive', 'replan'] as const;
+export type Verdict = (typeof VERDICTS)[number];
+
+/**
+ * 判断任意值是否为允许的检查结论。
+ * 报告解析与持久化记录校验都调用它，两边不会因为各写一份列表而漂移。
+ * @param value 待判断的未知值。
+ * @returns 是合法结论时为 true，并收窄类型。
+ */
+export function isVerdict(value: unknown): value is Verdict {
+  return typeof value === 'string' && (VERDICTS as readonly string[]).includes(value);
+}
+
+/**
+ * 判断任意值是否为允许的检查类型。
+ * @param value 待判断的未知值。
+ * @returns 是 function 或 module 时为 true，并收窄类型。
+ */
+export function isKind(value: unknown): value is ReviewKind {
+  return typeof value === 'string' && (KINDS as readonly string[]).includes(value);
+}
+
 /** 函数检查交给审计，模块及跨模块检查交给监理。 */
 export interface ReviewRequest {
-  kind: 'function' | 'module';
+  kind: ReviewKind;
   target: string;
   goal: string;
   contract: string;
@@ -22,7 +49,7 @@ export interface Finding { location: string; problem: string; evidence: string }
 
 /** replan 只允许模块监理提出；inconclusive 表示证据不足，不能当作通过。 */
 export interface ReviewReport {
-  verdict: 'pass' | 'changes-required' | 'inconclusive' | 'replan';
+  verdict: Verdict;
   summary: string;
   findings: Finding[];
 }
@@ -123,7 +150,7 @@ export function parseRequest(value: unknown): ReviewRequest {
 export function parseReport(value: unknown, kind: ReviewRequest['kind']): ReviewReport {
   const row = record(value, ['verdict', 'summary', 'findings'], true);
   const verdict = row.verdict;
-  if (verdict !== 'pass' && verdict !== 'changes-required' && verdict !== 'inconclusive' && verdict !== 'replan') {
+  if (!isVerdict(verdict)) {
     throw new Error('Unsupported review verdict.');
   }
   if (!Array.isArray(row.findings)) throw new Error('findings must be an array.');

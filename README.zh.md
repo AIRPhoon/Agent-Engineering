@@ -70,7 +70,7 @@ dsh plugin --profile web add github:AIRPhoon/dsh-construction-site
 
 检查方只能看到报送材料，引用匹配不证明推理正确。不保证审查结论或节省 token，最终验收仍由用户决定。
 
-当前开发版在跨会话状态、历史排序、记录压缩和历史结构校验方面存在限制，见 [已知问题](docs/KNOWN_ISSUES.zh-CN.md)。科研文档的节间/章间流程不在当前范围内。
+当前开发版在历史排序和记录压缩方面仍有局限，见 [已知问题](docs/KNOWN_ISSUES.zh-CN.md)。科研文档的节间/章间流程不在当前范围内。
 
 ## 许可
 

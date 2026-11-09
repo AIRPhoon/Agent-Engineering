@@ -1,5 +1,5 @@
-import type { FinanceReport } from './finance.ts';
-import type { ReviewReport } from './review.ts';
+import { type FinanceReport } from './finance.ts';
+import { type ReviewReport } from './review.ts';
 /** 一次已完成的成果检查；fp 与运行时指纹一致，files 是 [工作区路径, 内容哈希]。 */
 export interface ReviewRecord {
     type: 'review';

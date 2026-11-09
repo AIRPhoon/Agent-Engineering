@@ -70,7 +70,7 @@ Use `kind: "module"` for module supervision. Add `financeQuestion` for a specifi
 
 Reviewers see only submitted material. Matching a quotation does not prove the reasoning is sound. Correctness and token savings are not guaranteed; final acceptance remains with the user.
 
-The development-stage limitations include cross-session state consistency, history ordering, record compaction, and history validation. See [known issues](docs/KNOWN_ISSUES.en.md). Scientific-document section/chapter workflows are outside the current scope.
+The remaining development-stage limitations are history ordering and record compaction. See [known issues](docs/KNOWN_ISSUES.en.md). Scientific-document section/chapter workflows are outside the current scope.
 
 ## License
 

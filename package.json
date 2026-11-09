@@ -1,6 +1,6 @@
 {
   "name": "dsh-construction-site",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "private": false,
   "description": "Construction-site-inspired review workflow for DeepSeek Harness: finance, function audits, and module supervision. / 面向 DeepSeek Harness 的施工现场式质量检查流程。",
   "type": "module",

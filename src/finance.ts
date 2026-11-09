@@ -12,8 +12,21 @@ export type FinanceTrigger = 'requested' | 'partial-change' | 'scope-change' | '
 export interface FinanceReason { source: string; quote: string; explanation: string }
 
 /** narrow 只提出较小的成果文件范围，保留原目标，交报送方整理必要上下文后重新申请。 */
+export const DECISIONS = ['allow', 'narrow', 'block', 'needs-information'] as const;
+export type FinanceVerdict = (typeof DECISIONS)[number];
+
+/**
+ * 判断任意值是否为允许的财务结论。
+ * 财务解析与持久化记录校验共用这一份列表。
+ * @param value 待判断的未知值。
+ * @returns 是合法结论时为 true，并收窄类型。
+ */
+export function isDecision(value: unknown): value is FinanceVerdict {
+  return typeof value === 'string' && (DECISIONS as readonly string[]).includes(value);
+}
+
 export interface FinanceReport {
-  decision: 'allow' | 'narrow' | 'block' | 'needs-information';
+  decision: FinanceVerdict;
   summary: string;
   reasons: FinanceReason[];
   proposedFiles: string[];
@@ -67,7 +80,7 @@ function sources(input: FinanceInput): Map<string, string> {
 export function parseFinanceReport(value: unknown, input: FinanceInput): FinanceReport {
   const row = record(value, ['decision', 'summary', 'reasons', 'proposedFiles'], true);
   const decision = row.decision;
-  if (decision !== 'allow' && decision !== 'narrow' && decision !== 'block' && decision !== 'needs-information') {
+  if (!isDecision(decision)) {
     throw new Error('Unsupported finance decision.');
   }
   if (!Array.isArray(row.reasons) || row.reasons.length === 0) throw new Error('Finance requires evidence-backed reasons.');

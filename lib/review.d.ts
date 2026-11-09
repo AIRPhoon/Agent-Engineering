@@ -1,8 +1,27 @@
 /** 检查的数据及 JSON 入口；由插件和离线流程测试共同使用。 */
 import type { ObjectJsonSchema } from '@deepseek-ai/dsh-tools';
+/** 检查对象的两种类型；路由与持久化结构校验共用。 */
+export declare const KINDS: readonly ['function', 'module'];
+export type ReviewKind = (typeof KINDS)[number];
+/** 检查结论的允许取值；报告解析与持久化结构校验共用，避免两处枚举漂移。 */
+export declare const VERDICTS: readonly ['pass', 'changes-required', 'inconclusive', 'replan'];
+export type Verdict = (typeof VERDICTS)[number];
+/**
+ * 判断任意值是否为允许的检查结论。
+ * 报告解析与持久化记录校验都调用它，两边不会因为各写一份列表而漂移。
+ * @param value 待判断的未知值。
+ * @returns 是合法结论时为 true，并收窄类型。
+ */
+export declare function isVerdict(value: unknown): value is Verdict;
+/**
+ * 判断任意值是否为允许的检查类型。
+ * @param value 待判断的未知值。
+ * @returns 是 function 或 module 时为 true，并收窄类型。
+ */
+export declare function isKind(value: unknown): value is ReviewKind;
 /** 函数检查交给审计，模块及跨模块检查交给监理。 */
 export interface ReviewRequest {
-    kind: 'function' | 'module';
+    kind: ReviewKind;
     target: string;
     goal: string;
     contract: string;
@@ -23,7 +42,7 @@ export interface Finding {
 }
 /** replan 只允许模块监理提出；inconclusive 表示证据不足，不能当作通过。 */
 export interface ReviewReport {
-    verdict: 'pass' | 'changes-required' | 'inconclusive' | 'replan';
+    verdict: Verdict;
     summary: string;
     findings: Finding[];
 }

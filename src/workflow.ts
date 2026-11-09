@@ -18,6 +18,8 @@ export interface FlowMemory {
   reviews?: ReviewRecord[];
   finance?: FinanceRecord[];
   record?: (entry: ReviewRecord | FinanceRecord) => Promise<void> | void;
+  /** 本会话实际使用的模型标识；写入记录时随条目保存，历史里据此追溯。 */
+  model?: string | null;
 }
 
 /** 明确区分财务驳回和检查结论；重复申请保留上次状态，不生成新的通过结论。 */
@@ -29,7 +31,55 @@ export type ReviewOutcome = { finance: FinanceDecision } & (
 interface Snapshot { details: string; files: Map<string, string> }
 
 /** 同一 kind/target 最近一次取得有效报告的报送；sequence 按申请顺序区分并发版本。 */
-interface Baseline extends Snapshot { fingerprint: string; verdict: ReviewReport['verdict']; report: ReviewReport; sequence: number }
+export interface Baseline extends Snapshot { fingerprint: string; verdict: ReviewReport['verdict']; report: ReviewReport; sequence: number }
+
+/**
+ * 同一工作区的共享检查状态：去重、基线、财务缓存和并发占位都在这里。
+ * 插件按工作区只建一份，各会话的 ReviewFlow 引用同一个对象，
+ * 这样“另一个会话刚检查过”的记录能在本进程内立刻生效，不必等重载。
+ */
+export interface FlowState {
+  /** 已取得的结论按指纹保存；同一报送再次申请时在这里被拦下。 */
+  readonly completed: Map<string, ReviewReport>;
+  /** 正在检查的指纹；并发申请共用一份，避免同一成果被并行检查两次。 */
+  readonly running: Set<string>;
+  /** 按 kind/target 保存最近有效报告的基线，供财务判断范围。 */
+  readonly baselines: Map<string, Baseline>;
+  /** 按财务输入指纹缓存判断，材料或基线变化后自然失效。 */
+  readonly financeCache: Map<string, FinanceReport>;
+  /** 申请顺序号；晚返回的旧申请不能覆盖较新的基线。 */
+  sequence: number;
+}
+
+/**
+ * 新建空的共享状态；每个工作区第一次加载记忆时创建一次。
+ * @returns 供各会话共用、尚未填充历史的状态。
+ */
+export function createFlowState(): FlowState {
+  return {
+    completed: new Map(), running: new Set(), baselines: new Map(), financeCache: new Map(), sequence: 0,
+  };
+}
+
+/**
+ * 用持久化记忆填充共享状态；只在该工作区首次加载时调用一次。
+ * 记录按“报送开始时间”重放：完成顺序可能乱序，旧版本不能因为晚落盘而变成最新基线。
+ * @param state 待填充的共享状态。
+ * @param memory 从磁盘读到的历史记录；没有历史时什么也不做。
+ */
+export function seedFlowState(state: FlowState, memory: FlowMemory): void {
+  const ordered = [...(memory.reviews ?? [])].sort((left, right) =>
+    (left.startedAt ?? '').localeCompare(right.startedAt ?? '') || (left.at ?? '').localeCompare(right.at ?? ''));
+  for (const review of ordered) {
+    // 证据不足的报告可以重查，不进入去重命中集，但仍留作“尚未通过”的基线依据。
+    if (review.verdict !== 'inconclusive') state.completed.set(review.fp, structuredClone(review.report));
+    state.baselines.set(review.scope, {
+      details: review.details, files: new Map(review.files), fingerprint: review.fp,
+      verdict: review.verdict, report: structuredClone(review.report), sequence: ++state.sequence,
+    });
+  }
+  for (const finance of memory.finance ?? []) state.financeCache.set(finance.key, structuredClone(finance.report));
+}
 
 /** 对固定字段序列取 SHA-256，供 run 的去重与报送约定比较复用。 */
 function hash(value: unknown): string {
@@ -103,35 +153,27 @@ function financeTrigger(request: ReviewRequest, current: Snapshot, previous: Bas
 
 /** 单个会话的内存缓存，插件重载后清空；持久结果由 DSH 工具日志保存。 */
 export class ReviewFlow {
-  // Map 按指纹保存结论；Set 只保存正在检查的指纹，分别用于已完成和并发申请的去重。
-  private readonly completed = new Map<string, ReviewReport>();
-  private readonly running = new Set<string>();
-  // kind 与 target 共同确定检查对象；函数与模块不能借用彼此的通过记录。
-  private readonly baselines = new Map<string, Baseline>();
-  // 同一财务输入复用判断，避免补证前反复花费；改变材料、问题或历史报告会生成新键。
-  private readonly financeCache = new Map<string, FinanceReport>();
-  private sequence = 0;
+  // 去重、基线、财务缓存与并发占位放在共享状态里，同一工作区的多个会话看到同一份。
+  private readonly state: FlowState;
   /** 适配层提供的持久化回调；没有它时本实例只保存在内存。 */
   private readonly record: ((entry: ReviewRecord | FinanceRecord) => Promise<void> | void) | undefined;
+  /** 本实例所属会话的模型标识，随记录落盘；共享状态不保存它，避免会话之间互相覆盖。 */
+  private readonly model: string | null;
 
   /**
-   * 用插件级记忆的热启动数据填充去重、基线与财务缓存。
-   * 种子按文件顺序重放：同一对象后出现的记录覆盖先前的基线。
    * @param memory 历史记录与写入回调；测试与无记忆场景可省略。
+   * @param state 已有的共享状态；传入时直接沿用，不再重放 memory，避免重复填充。
+   *   不传时新建一份并用 memory 填充，保持单会话调用方式不变。
    */
-  constructor(memory: FlowMemory = {}) {
-    // 按“报送开始时间”重放：完成顺序可能乱序，旧版本不能因为晚落盘而变成最新基线。
-    const ordered = [...(memory.reviews ?? [])].sort((left, right) =>
-      (left.startedAt ?? '').localeCompare(right.startedAt ?? '') || (left.at ?? '').localeCompare(right.at ?? ''));
-    for (const review of ordered) {
-      if (review.verdict !== 'inconclusive') this.completed.set(review.fp, structuredClone(review.report));
-      this.baselines.set(review.scope, {
-        details: review.details, files: new Map(review.files), fingerprint: review.fp,
-        verdict: review.verdict, report: structuredClone(review.report), sequence: ++this.sequence,
-      });
+  constructor(memory: FlowMemory = {}, state?: FlowState) {
+    if (state === undefined) {
+      this.state = createFlowState();
+      seedFlowState(this.state, memory);
+    } else {
+      this.state = state;
     }
-    for (const finance of memory.finance ?? []) this.financeCache.set(finance.key, structuredClone(finance.report));
     this.record = memory.record;
+    this.model = memory.model ?? null;
   }
 
   /**
@@ -161,7 +203,7 @@ export class ReviewFlow {
     const startedAt = new Date().toISOString();
     const current = snapshot(request, evidence);
     const scope = JSON.stringify([request.kind, request.target]);
-    const baseline = this.baselines.get(scope);
+    const baseline = this.state.baselines.get(scope);
     let finance = assessScope(current, baseline);
     // 给出真实文件时，文件哈希就是成果身份，
     // 粘贴文本不再参与指纹：同一批文件内容没变就是重复申请，文件一改指纹自然变化。
@@ -170,19 +212,19 @@ export class ReviewFlow {
       evidence.length === 0 ? request.code : '',
       [...current.files],
     ]);
-    const previous = this.completed.get(fingerprint);
+    const previous = this.state.completed.get(fingerprint);
     if (previous !== undefined) return {
       status: 'blocked', fingerprint, reason: 'duplicate', previous: structuredClone(previous),
       finance: { decision: 'block', reason: '同一报送已有检查报告，本次不启动检查；保留上次结论，不表示新增通过。', baselineFingerprint: fingerprint, previousVerdict: previous.verdict, changes: null },
     };
-    if (this.running.has(fingerprint)) return {
+    if (this.state.running.has(fingerprint)) return {
       status: 'blocked', fingerprint, reason: 'in-progress', previous: null,
       finance: { decision: 'block', reason: '同一报送正在检查，仅阻止本次重复调用。', baselineFingerprint: fingerprint, previousVerdict: null, changes: null },
     };
 
     // 在首个 await 之前占位，同一进程内并发申请也只启动一次检查。
-    this.running.add(fingerprint);
-    const sequence = ++this.sequence;
+    this.state.running.add(fingerprint);
+    const sequence = ++this.state.sequence;
     try {
       const trigger = financeTrigger(request, current, baseline, finance);
       if (trigger !== null) {
@@ -190,17 +232,17 @@ export class ReviewFlow {
         const input = { request: structuredClone(request), files: structuredClone(evidence),
           program: structuredClone(finance), previousReport: baseline === undefined ? null : structuredClone(baseline.report), trigger };
         const cacheKey = hash([fingerprint, current.details, request.financeQuestion ?? null, finance, input.previousReport, trigger]);
-        let report = this.financeCache.get(cacheKey);
+        let report = this.state.financeCache.get(cacheKey);
         const cached = report !== undefined;
         if (report === undefined) {
           if (financier === undefined) throw new Error('Semantic finance is required for this request.');
           const result = await financier(structuredClone(input), signal);
           signal.throwIfAborted();
           report = parseFinanceReport(result, input);
-          this.financeCache.set(cacheKey, structuredClone(report));
+          this.state.financeCache.set(cacheKey, structuredClone(report));
           await this.write({
             type: 'finance', v: 1, key: cacheKey, decision: report.decision,
-            report: structuredClone(report), model: null, at: new Date().toISOString(),
+            report: structuredClone(report), model: this.model, at: new Date().toISOString(),
           });
         }
         // 缓存和回调都不持有返回给调用方的可变对象。
@@ -214,20 +256,20 @@ export class ReviewFlow {
       const report = parseReport(await review(request, signal, structuredClone(finance)), request.kind);
       signal.throwIfAborted();
       // 证据不足可以重新检查；失败、取消及格式错误也不写成已通过或已完成。
-      if (report.verdict !== 'inconclusive') this.completed.set(fingerprint, structuredClone(report));
+      if (report.verdict !== 'inconclusive') this.state.completed.set(fingerprint, structuredClone(report));
       // 晚返回的旧申请不能覆盖较新申请的比较基线；inconclusive 可留作“尚未通过”的依据，仍允许重试。
-      if (sequence > (this.baselines.get(scope)?.sequence ?? 0)) {
-        this.baselines.set(scope, { ...current, fingerprint, verdict: report.verdict, report: structuredClone(report), sequence });
+      if (sequence > (this.state.baselines.get(scope)?.sequence ?? 0)) {
+        this.state.baselines.set(scope, { ...current, fingerprint, verdict: report.verdict, report: structuredClone(report), sequence });
       }
       // 热启动时按文件顺序重放这些记录；同一对象后出现的记录覆盖先前的基线。
       await this.write({
         type: 'review', v: 1, fp: fingerprint, scope, kind: request.kind, target: request.target,
         verdict: report.verdict, details: current.details, files: [...current.files],
-        report: structuredClone(report), model: null, startedAt, at: new Date().toISOString(),
+        report: structuredClone(report), model: this.model, startedAt, at: new Date().toISOString(),
       });
       return { status: 'reviewed', fingerprint, recipient: request.kind === 'function' ? 'executor' : 'planner', report, finance };
     } finally {
-      this.running.delete(fingerprint);
+      this.state.running.delete(fingerprint);
     }
   }
 }

@@ -13,7 +13,7 @@ import { readEvidence, type EvidenceFile } from './evidence.ts';
 import { financePrompt, parseFinanceText } from './finance.ts';
 import { parseReportText, parseRequest, requestSchema, type ReviewRequest } from './review.ts';
 import { ReviewStore, type ProjectMemory } from './store.ts';
-import { ReviewFlow, type FinanceDecision } from './workflow.ts';
+import { ReviewFlow, createFlowState, seedFlowState, type FinanceDecision } from './workflow.ts';
 import { UsageLedger, type Role } from './usage.ts';
 
 /** Cordis 注册名与所需服务；缺少服务时由框架保持插件未激活。 */
@@ -25,7 +25,7 @@ export const Config = z.object({
   provider: z.string().required(),
   expectedModel: z.string().required(),
   promptOrder: z.number().required(),
-  // 完成前门禁：本轮改过代码文件却没有报送检查时，steer 一步提醒；关掉后恢复纯自愿报送。
+  // 子 Agent 完成前门禁：写过代码却未报审时 steer 提醒；主 Agent 仅接收系统职责提示。
   reviewGate: z.boolean().default(true),
   // 模型不一致时默认继续检查并给出警告，避免换模型后整个插件在运行时报错。
   strictModel: z.boolean().default(false),
@@ -46,7 +46,7 @@ interface ReviewOwner { parent: string; role: Role }
 
 /**
  * 是否是执行方子 Agent。会话元数据里的 `origin`（subagent 标记）或委派深度
- * 只要有一个成立就是子 Agent；主对话两者都没有，因此不会被报送提示和门禁打扰。
+ * 只要有一个成立就是子 Agent；用于区分报审职责及门禁范围，主对话不接收 steer 催报消息。
  * @param agent 一次工具执行或提示组装对应的 Agent。
  * @returns 子 Agent 为 true，主对话为 false。
  */
@@ -154,17 +154,14 @@ function fileKey(root: string, path: string): string {
 export function apply(ctx: Context, config: PluginConfig): void {
   if (config.provider.trim() === '' || config.expectedModel.trim() === '') throw new Error('Provider and expectedModel must be explicit.');
   if (!Number.isFinite(config.promptOrder)) throw new Error('promptOrder must be finite.');
-  const flows = new Map<string, ReviewFlow>();
   const owners = new Map<string, ReviewOwner>();
   const debts = new Map<string, ReviewDebt>();
   const ledger = new UsageLedger();
   // 插件级记忆：按工作区保存在 DSH_HOME 下，重启后热启动去重与基线；不可写时自动降级为内存。
   const store = new ReviewStore();
-  const memories = new Map<string, ProjectMemory>();
-  // 同一 Agent 的并发首次调用共用一次记忆加载，避免创建两个 ReviewFlow。
-  const flowLoads = new Map<string, Promise<{ memory: ProjectMemory; flow: ReviewFlow }>>();
-  // 会话代际：加载期间收到 disposed 时，不能用旧代次的加载结果回填 maps。
-  const agentEpochs = new Map<string, number>();
+  // 同一工作区只加载一次记忆，并把去重/基线/财务状态放在共享对象里：
+  // 这样同一进程里另一个会话刚完成的检查，这边立刻就能拦住重复申请，不必等转世重载。
+  const workspaces = new Map<string, Promise<{ memory: ProjectMemory; state: ReturnType<typeof createFlowState> }>>();
   const lifetime = new AbortController();
   const active = new Set<Promise<unknown>>();
   const workingDirectory = (ctx as unknown as { workingDirectory: WorkingDirectoryService }).workingDirectory;
@@ -173,10 +170,17 @@ export function apply(ctx: Context, config: PluginConfig): void {
     name: 'personal-quality-control', order: config.promptOrder, interpolate: false,
     text: context => {
       const agent = context.agent;
-      // 只提醒执行方子 Agent；主对话不注入，主 Agent 需要时手动调用工具。
-      if (agent === undefined || owners.has(agent.id) || !isExecutor(agent)) return '';
-      return '你是执行方：每完成一个具体功能函数并取得验证证据，调用 quality_review(kind=function) 报送。'
-        + '完整功能模块由主 Agent 汇总后手动请监理，你不要代为报送模块。'
+      // 职责放在系统提示中，不追加对话消息；检查子 Agent 只接收各自的独立检查任务。
+      if (agent === undefined || owners.has(agent.id)) return '';
+      const duties = isExecutor(agent)
+        ? '你是执行方：每完成一个具体功能函数并取得验证证据，调用 quality_review(kind=function) 报送。'
+          + '完整功能模块由主 Agent 汇总后报送监理，你不要代为报送模块。'
+        : '你是主 Agent，兼任规划方和执行总包：围绕主人的目标规划任务、组织执行，可以自行完成或按需要委派子 Agent。'
+          + '自己完成的具体功能函数取得验证证据后，调用 quality_review(kind=function) 报送；委派的函数由执行方子 Agent 报送并处理审计意见。'
+          + '完整功能模块及相关集成验证完成后，由你汇总成果并主动调用 quality_review(kind=module) 报送监理。'
+          + '你负责落实检查意见：自行执行的函数问题由你修正；委派任务的问题组织执行方修正；模块监理意见先用于调整受影响任务，再下发执行。'
+          + '持续无法解决的规划争议交给主人裁决，不得自行修改主人目标。';
+      return duties
         + '优先用 files 报送工作区相对路径，让检查读取真实文件：除本次成果外，尽量附上调用方、接口定义和测试输出（把测试输出存成工作区文本文件一并报送）。审查方不会重新运行测试，只核对报送的输出。只有文件不在工作区时才粘贴代码。'
         + '如实提交目标、接口约定、必要上下文及验证结果。函数审计意见由你处理；模块监理意见由主 Agent 调整受影响任务后再下发。'
         + '财务 blocked 仅阻止该次检查，不代表通过，也不阻止其余检查。处理检查发现的问题后，提交有变化的成果或新增证据；没有变化不要重复申请。'
@@ -208,7 +212,8 @@ export function apply(ctx: Context, config: PluginConfig): void {
   ctx.effect(() => ctx.tools.guard(exec => owners.has(exec.agent?.id ?? '')
     ? 'Review agents cannot execute tools.' : undefined));
 
-  // 门禁观察：只登记成功的源码写入。清账由 quality_review 在执行结束时按实际读取结果处理，
+  // 门禁观察：只登记执行方子 Agent 成功的源码写入，主对话不产生催报消息。
+  // 清账由 quality_review 在执行结束时按实际读取结果处理，
   // 不能在这里看到工具名就删账——报审失败、财务阻止或只报部分文件时都不该清。
   ctx.effect(() => ctx.on('tools/post-execute', async (exec, result, next) => {
     const agent = exec.agent;
@@ -245,9 +250,9 @@ export function apply(ctx: Context, config: PluginConfig): void {
   }));
 
   // 会话结束时丢掉该 Agent 的欠账记录，避免长进程里按会话累积。
+  // 工作区记忆与共享检查状态不随会话释放：它们正是跨会话去重与基线的依据。
   ctx.effect(() => ctx.on('agent/disposed', ({ agent }) => {
-    debts.delete(agent.id); memories.delete(agent.id); flows.delete(agent.id); flowLoads.delete(agent.id);
-    agentEpochs.set(agent.id, (agentEpochs.get(agent.id) ?? 0) + 1);
+    debts.delete(agent.id);
   }));
 
   // waterfall（瀑布式事件）必须调用 next()；逐项透传分片，不修改模型输入或提供方输出。
@@ -337,38 +342,25 @@ export function apply(ctx: Context, config: PluginConfig): void {
       const root = await workingDirectory.ensure(parent, signal);
       const files = await readEvidence(root, request.files);
       signal.throwIfAborted();
-      let memory = memories.get(parent.id);
-      let flow = flows.get(parent.id);
-      if (flow === undefined) {
-        // 首次检查才读取插件级记忆：按工作区热启动去重、基线与财务缓存。
-        // 并发首次调用共享同一个加载 Promise，否则会创建两个 ReviewFlow 和两份记忆。
-        let loading = flowLoads.get(parent.id);
-        if (loading === undefined) {
-          loading = (async () => {
-            const epoch = agentEpochs.get(parent.id) ?? 0;
-            const loaded = await store.load(root);
-            const created = new ReviewFlow({
-              reviews: loaded.reviews,
-              finance: loaded.finance,
-              record: entry => loaded.append({ ...entry, model: parent.options.model ?? null }),
-            });
-            // 加载等待期间会话可能已被释放；代际不变才回填，避免清理后被重新写回。
-            if ((agentEpochs.get(parent.id) ?? 0) === epoch) {
-              memories.set(parent.id, loaded);
-              flows.set(parent.id, created);
-            }
-            return { memory: loaded, flow: created };
-          })();
-          flowLoads.set(parent.id, loading);
-          // 只删除仍指向本次加载的占位：旧加载完成时若已登记了新加载，不能把它删掉。
-          const release = () => { if (flowLoads.get(parent.id) === loading) flowLoads.delete(parent.id); };
-          loading.then(release, release);
-        }
-        const loaded = await loading;
-        memory = loaded.memory;
-        flow = loaded.flow;
-        if (memory.degraded !== null) warnings.push(`检查记忆不可用，本次结论只保存在内存：${memory.degraded}`);
+      // 工作区记忆与共享状态按真实路径缓存：首次调用从磁盘加载，之后所有会话共用，
+      // 会话结束也不释放，跨会话去重与比较基线因此保持一致。
+      const workspaceKey = fileKey(root, '.');
+      let workspace = workspaces.get(workspaceKey);
+      if (workspace === undefined) {
+        workspace = store.load(root).then(memory => {
+          const state = createFlowState();
+          seedFlowState(state, memory);
+          return { memory, state };
+        });
+        // 加载异常（store.load 自身已降级，这里只防占位残留）时丢掉占位，下次重新加载。
+        const release = () => { if (workspaces.get(workspaceKey) === workspace) workspaces.delete(workspaceKey); };
+        workspace.catch(release);
+        workspaces.set(workspaceKey, workspace);
       }
+      const { memory, state } = await workspace;
+      // 每次调用新建流程对象：它只承载本会话的模型标识和写入回调，状态全部来自共享对象。
+      const flow = new ReviewFlow({ record: entry => memory.append(entry), model: parent.options.model ?? null }, state);
+      if (memory.degraded !== null) warnings.push(`检查记忆不可用，本次结论只保存在内存：${memory.degraded}`);
       const operation = flow.run(request, files, async (item, inner, finance) => {
         // 财务放行后才进入此回调；等待审计/监理子会话返回文字，再按成果报告协议校验。
         const output = await runChild(parent, item.kind === 'function' ? 'audit' : 'supervisor',
@@ -392,7 +384,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
             if (debt.writes.size === 0) debts.delete(parent.id);
           }
         }
-        if (memory !== undefined && memory.degraded !== null) {
+        if (memory.degraded !== null) {
           const text = `检查记忆写入失败，本次结论只保存在内存：${memory.degraded}`;
           if (!warnings.includes(text)) warnings.push(text);
         }

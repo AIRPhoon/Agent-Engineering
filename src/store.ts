@@ -6,8 +6,8 @@ import { createHash } from 'node:crypto';
 import { appendFile, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import type { FinanceReport } from './finance.ts';
-import type { ReviewReport } from './review.ts';
+import { isDecision, type FinanceReason, type FinanceReport } from './finance.ts';
+import { isKind, isVerdict, type Finding, type ReviewReport } from './review.ts';
 
 /** 一次已完成的成果检查；fp 与运行时指纹一致，files 是 [工作区路径, 内容哈希]。 */
 export interface ReviewRecord {
@@ -111,6 +111,102 @@ async function fileSize(file: string): Promise<number> {
   }
 }
 
+/** 非空文本；结构校验只判断可读性，不重新解释内容。 */
+function isText(value: unknown): value is string {
+  return typeof value === 'string' && value.trim() !== '';
+}
+
+/** 可解析的时间戳；坏时间会让基线排序失序，因此按坏记录处理。 */
+function stamp(value: unknown): boolean {
+  return typeof value === 'string' && Number.isFinite(Date.parse(value));
+}
+
+/** 查报告里的一条意见；字段类型不对就不能当作可用报告。 */
+function isFinding(value: unknown): value is Finding {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const row = value as Record<string, unknown>;
+  return isText(row.location) && isText(row.problem) && isText(row.evidence);
+}
+
+/**
+ * 校验审查报告的结构与自洽性。
+ * 只接受程序会写出的形状，并与 parseReport 的规则对齐：
+ * pass 不能带未解决意见，要求修改或重规划必须有意见，replan 只属于模块检查。
+ * @param value 记录里的 report 字段。
+ * @param kind 记录声明的检查类型。
+ * @returns 可安全用于去重与基线恢复时为 true。
+ */
+function isReviewReport(value: unknown, kind: 'function' | 'module'): value is ReviewReport {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const row = value as Record<string, unknown>;
+  const verdict = row.verdict;
+  if (!isVerdict(verdict)) return false;
+  if (!isText(row.summary) || !Array.isArray(row.findings) || !row.findings.every(isFinding)) return false;
+  if (verdict === 'pass' && row.findings.length !== 0) return false;
+  if ((verdict === 'changes-required' || verdict === 'replan') && row.findings.length === 0) return false;
+  return verdict !== 'replan' || kind === 'module';
+}
+
+/** 校验财务理由：来源、引文和说明都必须是文本，缺一个就不能复核。 */
+function isFinanceReason(value: unknown): value is FinanceReason {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const row = value as Record<string, unknown>;
+  return isText(row.source) && isText(row.quote) && isText(row.explanation);
+}
+
+/**
+ * 校验一条审查记录：浅层字段、文件配对与报告结构都要成立。
+ * 坏记录曾经的后果是被当作真实性通过塞进去重集，或让 new Map 直接抛错，
+ * 因此这里宁可整条跳过，也不把可疑数据当历史。
+ * @param value 一行 JSON 解析结果。
+ * @returns 结构可信时为 true。
+ */
+function isReviewRecord(value: unknown): value is ReviewRecord {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const row = value as Record<string, unknown>;
+  if (row.type !== 'review' || row.v !== 1) return false;
+  if (!isText(row.fp) || !isText(row.scope) || !isText(row.target) || !isText(row.details)) return false;
+  const kind = row.kind;
+  if (!isKind(kind)) return false;
+  const verdict = row.verdict;
+  if (!isVerdict(verdict)) return false;
+  if (!stamp(row.startedAt) || !stamp(row.at)) return false;
+  if (row.model !== null && typeof row.model !== 'string') return false;
+  if (!Array.isArray(row.files)) return false;
+  for (const pair of row.files) {
+    if (!Array.isArray(pair) || pair.length !== 2 || !isText(pair[0]) || !isText(pair[1])) return false;
+  }
+  if (!isReviewReport(row.report, kind)) return false;
+  // 记录结论与报告结论必须一致，避免改了一处就留下自相矛盾的通过记录。
+  return row.report.verdict === verdict;
+}
+
+/**
+ * 校验一条财务记录：结论、理由与建议文件都必须自洽。
+ * @param value 一行 JSON 解析结果。
+ * @returns 结构可信时为 true。
+ */
+function isFinanceRecord(value: unknown): value is FinanceRecord {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const row = value as Record<string, unknown>;
+  if (row.type !== 'finance' || row.v !== 1 || !isText(row.key) || !stamp(row.at)) return false;
+  const decision = row.decision;
+  if (!isDecision(decision)) return false;
+  if (row.model !== null && typeof row.model !== 'string') return false;
+  const report = row.report;
+  if (report === null || typeof report !== 'object' || Array.isArray(report)) return false;
+  const fields = report as Record<string, unknown>;
+  const reportDecision = fields.decision;
+  if (!isDecision(reportDecision)) return false;
+  if (!isText(fields.summary)) return false;
+  if (!Array.isArray(fields.reasons) || fields.reasons.length === 0 || !fields.reasons.every(isFinanceReason)) return false;
+  if (!Array.isArray(fields.proposedFiles) || !fields.proposedFiles.every(isText)) return false;
+  // 与 parseFinanceReport 一致：只有 narrow 可以给出较小的文件范围。
+  if (reportDecision === 'narrow' ? fields.proposedFiles.length === 0 : fields.proposedFiles.length !== 0) return false;
+  return reportDecision === decision;
+}
+
+
 /** 项目目录总大小（记录 + 摘要），用于全局预算与淘汰。 */
 async function dirSize(dir: string): Promise<number> {
   let total = 0;
@@ -142,14 +238,9 @@ async function readProject(dir: string): Promise<{ reviews: ReviewRecord[]; fina
     } catch {
       continue;
     }
-    if (row === null || typeof row !== 'object') continue;
-    const record = row as Partial<MemoryRecord>;
-    if (record.v !== 1) continue;
-    if (record.type === 'review' && typeof record.fp === 'string' && Array.isArray(record.files) && record.report !== undefined) {
-      reviews.push(record as ReviewRecord);
-    } else if (record.type === 'finance' && typeof record.key === 'string' && record.report !== undefined) {
-      finance.push(record as FinanceRecord);
-    }
+    // 结构不可信的记录整条跳过：坏行只损失一条历史，不能污染去重集或让加载抛错。
+    if (isReviewRecord(row)) reviews.push(row);
+    else if (isFinanceRecord(row)) finance.push(row);
   }
   return { reviews, finance };
 }
