@@ -8,6 +8,8 @@ English | [中文](README.zh.md)
 
 A construction-site-inspired workflow for DeepSeek Harness: the main Agent plans and executes, finance decides whether a review is needed, function auditors inspect completed functions, and module supervisors check integration and objectives.
 
+Independent community plugin; not affiliated with DeepSeek AI. Category: **Workflow & Automation**.
+
 ## Install
 
 **DSH Desktop:** Open the plugin manager and install from this GitHub repository:
@@ -56,6 +58,12 @@ After completing a function, submit its objective, contract, relevant files, cal
 ```
 
 Use `kind: "module"` for module supervision. Add `financeQuestion` for a specific scope or necessity concern. When finance requests a smaller scope or more evidence, address that feedback and resubmit actual changes or additional material while preserving the original objective and necessary context.
+
+## Permissions and model services
+
+- The host plugin reads the workspace files explicitly submitted through `files`, and writes or prunes its own review history under `$DSH_HOME/quality/v1/`.
+- Submitted material is sent to the parent session's configured model provider, which may be remote. No additional model service or API key is required by this plugin.
+- Review children cannot execute tools. The plugin does not give them code-modification permission; follow-up changes remain the main Agent's responsibility under the user's authorization.
 
 ## Scope and limitations
 
