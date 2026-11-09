@@ -1,0 +1,385 @@
+/**
+ * 插件级检查记忆：按工作区持久化去重、比较基线和财务判断，并按活跃度遗忘。
+ * 状态放在 DSH_HOME 下，不依赖项目是否维护 memory/，也不进入任何一次检查的材料。
+ */
+import { createHash } from 'node:crypto';
+import { appendFile, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import type { FinanceReport } from './finance.ts';
+import type { ReviewReport } from './review.ts';
+
+/** 一次已完成的成果检查；fp 与运行时指纹一致，files 是 [工作区路径, 内容哈希]。 */
+export interface ReviewRecord {
+  type: 'review';
+  v: 1;
+  /** 成果指纹：kind/目标/约定/材料/文件哈希的 SHA-256。 */
+  fp: string;
+  /** JSON.stringify([kind, target])，用于定位同一检查对象。 */
+  scope: string;
+  kind: 'function' | 'module';
+  target: string;
+  verdict: ReviewReport['verdict'];
+  /** 文字材料哈希，供财务判断“材料是否变化”。 */
+  details: string;
+  files: Array<[string, string]>;
+  report: ReviewReport;
+  model: string | null;
+  /** 报送开始时间（ISO），热启动按它重放，避免乱序完成把旧版本当成最新基线。 */
+  startedAt: string;
+  at: string;
+}
+
+/** 一次按需财务判断；key 是运行时缓存键，材料或基线变化后自然失效。 */
+export interface FinanceRecord {
+  type: 'finance';
+  v: 1;
+  key: string;
+  decision: FinanceReport['decision'];
+  report: FinanceReport;
+  model: string | null;
+  at: string;
+}
+
+export type MemoryRecord = ReviewRecord | FinanceRecord;
+
+/** 当前工作区的记忆句柄；append 失败只降级为警告，不改变检查结论。 */
+export interface ProjectMemory {
+  readonly reviews: ReviewRecord[];
+  readonly finance: FinanceRecord[];
+  degraded: string | null;
+  append(record: MemoryRecord): Promise<void>;
+}
+
+/** 可注入时钟与预算，便于测试遗忘策略；不传时使用真实时间与默认值。 */
+export interface StoreOptions {
+  home?: string;
+  now?: () => Date;
+  ttlMs?: number;
+  maxProjects?: number;
+  maxBytes?: number;
+  maxProjectBytes?: number;
+  pruneIntervalMs?: number;
+  /** 删除项目目录的实现；测试可注入失败以验证“删不掉就保留索引”。 */
+  remove?: (path: string) => Promise<void>;
+}
+
+/** 活跃项目 60 天未使用即视为不活跃；单项目与全局都有上限，防止 C 盘无序增长。 */
+const DEFAULT_TTL_MS = 60 * 24 * 60 * 60 * 1000;
+const DEFAULT_MAX_PROJECTS = 32;
+const DEFAULT_MAX_BYTES = 16 * 1024 * 1024;
+const DEFAULT_MAX_PROJECT_BYTES = 512 * 1024;
+const DEFAULT_PRUNE_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const KEEP_RECENT_REVIEWS = 20;
+const KEEP_FINANCE = 32;
+const SUMMARY_REVIEWS = 20;
+const SUMMARY_FINANCE = 10;
+
+/** 项目目录名：真实路径的短哈希；Windows 路径不区分大小写，先转小写。 */
+function projectKey(workspace: string): string {
+  const normalized = process.platform === 'win32' ? workspace.toLowerCase() : workspace;
+  return createHash('sha256').update(normalized).digest('hex').slice(0, 16);
+}
+
+/** 错误统一转成可读文本，写进 degraded 后由工具结果提示。 */
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** 先写临时文件再改名，避免读到写了一半的索引或摘要。 */
+async function writeAtomic(file: string, text: string): Promise<void> {
+  const temp = `${file}.${process.pid}.${Date.now().toString(36)}.${Math.random().toString(36).slice(2, 8)}`;
+  await writeFile(temp, text, 'utf8');
+  await rename(temp, file);
+}
+
+/** 读取 JSON 文件；缺失或损坏都返回 null，由调用方决定回退。 */
+async function readJson(file: string): Promise<unknown> {
+  try {
+    return JSON.parse(await readFile(file, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+/** 记录文件大小；文件不存在按 0 处理，用于触发压缩。 */
+async function fileSize(file: string): Promise<number> {
+  try {
+    return (await stat(file)).size;
+  } catch {
+    return 0;
+  }
+}
+
+/** 项目目录总大小（记录 + 摘要），用于全局预算与淘汰。 */
+async function dirSize(dir: string): Promise<number> {
+  let total = 0;
+  let names: string[] = [];
+  try {
+    names = await readdir(dir);
+  } catch {
+    return 0;
+  }
+  for (const name of names) total += await fileSize(join(dir, name));
+  return total;
+}
+
+/** 读取并校验记录；单行损坏只跳过该行，不让整份历史失效。 */
+async function readProject(dir: string): Promise<{ reviews: ReviewRecord[]; finance: FinanceRecord[] }> {
+  const reviews: ReviewRecord[] = [];
+  const finance: FinanceRecord[] = [];
+  let text: string;
+  try {
+    text = await readFile(join(dir, 'records.jsonl'), 'utf8');
+  } catch {
+    return { reviews, finance };
+  }
+  for (const line of text.split('\n')) {
+    if (line.trim() === '') continue;
+    let row: unknown;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (row === null || typeof row !== 'object') continue;
+    const record = row as Partial<MemoryRecord>;
+    if (record.v !== 1) continue;
+    if (record.type === 'review' && typeof record.fp === 'string' && Array.isArray(record.files) && record.report !== undefined) {
+      reviews.push(record as ReviewRecord);
+    } else if (record.type === 'finance' && typeof record.key === 'string' && record.report !== undefined) {
+      finance.push(record as FinanceRecord);
+    }
+  }
+  return { reviews, finance };
+}
+
+/** 超过单项目上限时压缩：保留每个对象最新一条、最近 20 条审查与最近 32 条财务判断。 */
+async function compact(dir: string): Promise<void> {
+  const { reviews, finance } = await readProject(dir);
+  // “最近”按报送开始时间排序，而不是按完成顺序；否则乱序完成会把旧版本留成基线。
+  const reviewOrder = [...reviews].sort((left, right) =>
+    (left.startedAt ?? '').localeCompare(right.startedAt ?? '') || (left.at ?? '').localeCompare(right.at ?? ''));
+  const latestReview = new Map<string, ReviewRecord>();
+  for (const record of reviewOrder) latestReview.set(record.scope, record);
+  const recentReviews = new Set<ReviewRecord>(reviewOrder.slice(-KEEP_RECENT_REVIEWS));
+  const keepReview = new Set<ReviewRecord>([...latestReview.values(), ...recentReviews]);
+  const financeOrder = [...finance].sort((left, right) => (left.at ?? '').localeCompare(right.at ?? ''));
+  const latestFinance = new Map<string, FinanceRecord>();
+  for (const record of financeOrder) latestFinance.set(record.key, record);
+  const recentFinance = new Set<FinanceRecord>(financeOrder.slice(-KEEP_FINANCE));
+  const keepFinance = new Set<FinanceRecord>([...latestFinance.values(), ...recentFinance]);
+  const kept: MemoryRecord[] = [
+    ...reviews.filter(record => keepReview.has(record)),
+    ...finance.filter(record => keepFinance.has(record)),
+  ];
+  const text = kept.map(record => JSON.stringify(record)).join('\n');
+  await writeAtomic(join(dir, 'records.jsonl'), text === '' ? '' : `${text}\n`);
+}
+
+/** 生成人读摘要；只列最近结论，完整状态仍在 records.jsonl。 */
+async function writeSummary(dir: string, workspace: string, reviews: ReviewRecord[], finance: FinanceRecord[], now: Date): Promise<void> {
+  const lines = [
+    '# 检查记忆摘要',
+    '',
+    `工作区：${workspace}`,
+    `更新：${now.toISOString()}`,
+    `已记录：${reviews.length} 条审查、${finance.length} 条财务判断`,
+    '',
+    '## 最近审查',
+    ...reviews.slice(-SUMMARY_REVIEWS).map(record => `- ${record.at} [${record.verdict}] ${record.kind} ${record.target}（${record.fp.slice(0, 8)}）`),
+    '',
+    '## 最近财务',
+    ...finance.slice(-SUMMARY_FINANCE).map(record => `- ${record.at} [${record.decision}] ${record.report.summary.slice(0, 80)}`),
+    '',
+  ];
+  await writeAtomic(join(dir, 'summary.md'), lines.join('\n'));
+}
+
+/** 记录不可写时的降级句柄：本次检查照常完成，只是不会跨重启保留。 */
+function degradedMemory(reason: string): ProjectMemory {
+  return { reviews: [], finance: [], degraded: reason, async append() {} };
+}
+
+/** 当前工作区的记忆；append 由 ReviewFlow 在结论产生后调用。 */
+class LiveMemory implements ProjectMemory {
+  degraded: string | null = null;
+
+  constructor(
+    private readonly store: ReviewStore,
+    private readonly key: string,
+    private readonly dir: string,
+    private readonly workspace: string,
+    public readonly reviews: ReviewRecord[],
+    public readonly finance: FinanceRecord[],
+  ) {}
+
+  async append(record: MemoryRecord): Promise<void> {
+    try {
+      await this.store.appendRecord(this.dir, this.key, this.workspace, record);
+      if (record.type === 'review') this.reviews.push(record);
+      else this.finance.push(record);
+    } catch (error) {
+      this.degraded = errorText(error);
+    }
+  }
+}
+
+/** 宿主侧的记忆服务：加载当前项目、写入记录、按 TTL 与预算遗忘不活跃项目。 */
+export class ReviewStore {
+  private readonly base: string;
+  private readonly now: () => Date;
+  private readonly ttlMs: number;
+  private readonly maxProjects: number;
+  private readonly maxBytes: number;
+  private readonly maxProjectBytes: number;
+  private readonly pruneIntervalMs: number;
+  private readonly remove: (path: string) => Promise<void>;
+  /** 进程内所有记忆写操作共用一个队列：追加、压缩、摘要、索引与遗忘不会交错。 */
+  private queue: Promise<void> = Promise.resolve();
+
+  /** @param options 测试可注入 home、时钟和预算；生产使用 DSH_HOME 与默认值。 */
+  constructor(options: StoreOptions = {}) {
+    const home = options.home ?? process.env.DSH_HOME ?? join(homedir(), '.dsh');
+    this.base = join(home, 'quality', 'v1');
+    this.now = options.now ?? (() => new Date());
+    this.ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
+    this.maxProjects = options.maxProjects ?? DEFAULT_MAX_PROJECTS;
+    this.maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
+    this.maxProjectBytes = options.maxProjectBytes ?? DEFAULT_MAX_PROJECT_BYTES;
+    this.pruneIntervalMs = options.pruneIntervalMs ?? DEFAULT_PRUNE_INTERVAL_MS;
+    this.remove = options.remove ?? (path => rm(path, { recursive: true, force: true }));
+  }
+
+  /**
+   * 加载一个工作区的记忆；首次访问会登记项目并顺带执行节流后的遗忘。
+   * @param workspace 当前会话工作目录（绝对路径）。
+   * @returns 历史记录与写入句柄；目录不可写时返回 degraded，不抛错阻断检查。
+   */
+  async load(workspace: string): Promise<ProjectMemory> {
+    try {
+      const real = await realpath(workspace);
+      const key = projectKey(real);
+      const dir = join(this.base, 'projects', key);
+      // 整个加载（建目录、读记录、登记、遗忘、摘要）都在写队列内，另一个工作区的
+      // prune 不会在本项目读盘后、登记前删掉它的目录。
+      const { reviews, finance } = await this.enqueue(async () => {
+        await mkdir(dir, { recursive: true });
+        const state = await readProject(dir);
+        // 索引/节流/摘要写失败只影响登记与摘要，不能丢掉刚读到的历史。
+        await this.touchDirect(key, real).catch(() => {});
+        await this.pruneThrottledDirect(key).catch(() => {});
+        await writeSummary(dir, real, state.reviews, state.finance, this.now()).catch(() => {});
+        return state;
+      });
+      return new LiveMemory(this, key, dir, real, reviews, finance);
+    } catch (error) {
+      return degradedMemory(errorText(error));
+    }
+  }
+
+  /** 串行执行记忆写操作；单个任务失败不会让后续写永远被拒绝。 */
+  private async enqueue<T>(task: () => Promise<T>): Promise<T> {
+    const next = this.queue.then(() => task());
+    this.queue = next.then(() => undefined, () => undefined);
+    return next;
+  }
+
+  /** 追加记录并完成压缩、摘要与索引更新；全部在同一条队列内。 */
+  async appendRecord(dir: string, key: string, workspace: string, record: MemoryRecord): Promise<void> {
+    await this.enqueue(async () => {
+      await appendFile(join(dir, 'records.jsonl'), `${JSON.stringify(record)}\n`, 'utf8');
+      if (await fileSize(join(dir, 'records.jsonl')) > this.maxProjectBytes) await compact(dir);
+      const { reviews, finance } = await readProject(dir);
+      await writeSummary(dir, workspace, reviews, finance, this.now()).catch(() => {});
+      await this.touchDirect(key, workspace).catch(() => {});
+    });
+  }
+
+  /** 直接更新索引；调用方已持有写队列。 */
+  private async touchDirect(key: string, workspace: string): Promise<void> {
+    const index = await this.readIndex();
+    index.projects[key] = { path: workspace, lastUsed: this.now().toISOString() };
+    await this.writeIndex(index);
+  }
+
+  /** 读取索引；缺失或版本不符时从空索引开始，不迁移旧格式。 */
+  private async readIndex(): Promise<{ v: 1; projects: Record<string, { path: string; lastUsed: string }> }> {
+    const raw = await readJson(join(this.base, 'index.json'));
+    const projects = raw !== null && typeof raw === 'object' ? (raw as { projects?: unknown }).projects : undefined;
+    // projects 必须是对象；null 也满足 typeof === 'object'，会在这里被排除。
+    if (raw !== null && typeof raw === 'object' && (raw as { v?: unknown }).v === 1 && projects !== null && typeof projects === 'object') {
+      return raw as { v: 1; projects: Record<string, { path: string; lastUsed: string }> };
+    }
+    return { v: 1, projects: {} };
+  }
+
+  /** 原子写入索引，目录不存在时先创建。 */
+  private async writeIndex(index: { v: 1; projects: Record<string, { path: string; lastUsed: string }> }): Promise<void> {
+    await mkdir(this.base, { recursive: true });
+    await writeAtomic(join(this.base, 'index.json'), `${JSON.stringify(index, null, 2)}\n`);
+  }
+
+  /** 遗忘节流：默认每 6 小时检查一次；调用方已持有写队列。 */
+  private async pruneThrottledDirect(currentKey: string): Promise<void> {
+    const marker = await readJson(join(this.base, 'last-prune.json'));
+    const last = marker !== null && typeof marker === 'object' && typeof (marker as { at?: unknown }).at === 'string'
+      ? Date.parse((marker as { at: string }).at) : 0;
+    if (this.now().getTime() - last < this.pruneIntervalMs) return;
+    await this.pruneDirect(currentKey);
+    await mkdir(this.base, { recursive: true });
+    await writeAtomic(join(this.base, 'last-prune.json'), `${JSON.stringify({ at: this.now().toISOString() })}\n`);
+  }
+
+  /**
+   * 遗忘不活跃项目：先按 TTL，再按项目数/总字节预算淘汰最久未用的项目。
+   * 当前项目永不淘汰；被清项目写一行 prune.log。调用方已持有写队列，
+   * 因此这里的删目录不会与本进程的追加/压缩并发。
+   * @param currentKey 当前正在使用的项目，必须保留。
+   */
+  private async pruneDirect(currentKey: string): Promise<void> {
+    const index = await this.readIndex();
+    const projects = index.projects;
+    const sizes = new Map<string, number>();
+    for (const key of Object.keys(projects)) sizes.set(key, await dirSize(join(this.base, 'projects', key)));
+    const now = this.now().getTime();
+    const evicted: string[] = [];
+    const drop = async (key: string, reason: string): Promise<boolean> => {
+      const path = projects[key]?.path ?? key;
+      try {
+        await this.remove(join(this.base, 'projects', key));
+      } catch {
+        // 删不掉就保留索引条目：下一轮还会尝试，避免目录变成预算看不见的孤儿。
+        return false;
+      }
+      delete projects[key];
+      evicted.push(`${this.now().toISOString()}\t${reason}\t${path}`);
+      return true;
+    };
+    for (const key of Object.keys(projects)) {
+      if (key === currentKey) continue;
+      const last = Date.parse(projects[key]?.lastUsed ?? '');
+      if (!Number.isFinite(last) || now - last > this.ttlMs) await drop(key, 'ttl');
+    }
+    let total = [...sizes].reduce((sum, [key, size]) => sum + (projects[key] === undefined ? 0 : size), 0);
+    let count = Object.keys(projects).length;
+    if (count > this.maxProjects || total > this.maxBytes) {
+      const candidates = Object.keys(projects)
+        .filter(key => key !== currentKey)
+        .sort((left, right) => Date.parse(projects[left]?.lastUsed ?? '') - Date.parse(projects[right]?.lastUsed ?? ''));
+      for (const key of candidates) {
+        if (count <= this.maxProjects && total <= this.maxBytes) break;
+        const size = sizes.get(key) ?? 0;
+        const removed = await drop(key, 'lru');
+        if (!removed) continue;
+        count -= 1;
+        total -= size;
+      }
+    }
+    if (evicted.length > 0) {
+      await mkdir(this.base, { recursive: true }).catch(() => {});
+      await appendFile(join(this.base, 'prune.log'), `${evicted.join('\n')}\n`, 'utf8').catch(() => {});
+    }
+    await this.writeIndex(index);
+  }
+}

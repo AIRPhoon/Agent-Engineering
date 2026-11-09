@@ -1,0 +1,7 @@
+- insert:
+    - id: construction-site
+      name: dsh-construction-site
+      config:
+        provider: spawn
+        expectedModel: deepseek-v4.1-flash
+        promptOrder: 1200
