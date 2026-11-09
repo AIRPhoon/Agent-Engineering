@@ -27,8 +27,11 @@ dsh plugin --profile web add github:AIRPhoon/dsh-construction-site
 | `provider` | 本地新上下文子 Agent 提供方，发布配置为 `spawn` |
 | `expectedModel` | 用于核对的模型标识，请设置为自己的模型 |
 | `promptOrder` | 系统提示段顺序，发布配置为 `1200` |
-| `reviewGate` | 默认开启源码写入后的轮末提醒 |
+| `reviewGate` | 默认开启执行方子 Agent 的轮末提醒；主对话不提醒 |
 | `strictModel` | 默认关闭，开启后模型不匹配会阻止报审 |
+| `plainLanguage` | 默认开启：沿用用户本轮用词、先说结论、解释术语、不说行话 |
+| `styleSample` | 可选，一段希望看到的回答范文 |
+| `glossary` | 可选，每行一条“术语=大白话” |
 
 子 Agent 继承父会话的模型提供方，不应在插件配置中填写 API key。财务被触发时也会调用模型，因此不保证节省总开销。
 

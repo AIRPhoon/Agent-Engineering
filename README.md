@@ -36,7 +36,8 @@ Target host API: DSH 0.2.2-rc.1. Node.js 24.9 or later is required. Other host v
 - **Effective financial decisions:** finance can allow a review, request a smaller scope, block this request, or ask for more information. Only approval starts the audit. Reasons must cite actual submitted material.
 - **Read-only reviewers:** financial, audit, and supervisor children have no tool-execution permission and cannot modify code or rerun verification commands.
 - **Real files:** use workspace-relative `files` paths. The plugin reads and hashes the content; outside-workspace, binary, or oversized files are rejected. Limits are 256 KiB per file and 512 KiB in total.
-- **Turn-end reminders:** successful native `write` / `edit` calls on source files can prompt the main Agent to submit completed work. This is a reminder, not a hard delivery gate.
+- **Turn-end reminders:** successful native `write` / `edit` calls on source files by executor subagents can prompt them to submit completed work. The main conversation is not prompted or gated. This is a reminder, not a hard delivery gate.
+- **Plain-language replies:** with `plainLanguage` enabled (default), the main Agent is asked to mirror the user's current wording, lead with the conclusion, explain terms on first use, and avoid project jargon. Optional `styleSample` and `glossary` supply a model answer and term translations.
 - **Usage by role:** `quality_usage` summarizes provider-reported usage for main execution, audit, supervision, and finance. Missing or zero-filled reports do not establish zero actual usage.
 - **Review history:** review records and financial decisions are stored per workspace under `$DSH_HOME/quality/v1/`, or `~/.dsh/quality/v1/` if unset. Usage totals remain in memory.
 

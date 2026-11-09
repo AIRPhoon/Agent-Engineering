@@ -27,8 +27,11 @@ Use the host's plugin settings or official management tools:
 | `provider` | Local fresh-context child provider; `spawn` in the supplied patch |
 | `expectedModel` | Model identifier to compare against; set this to your own model |
 | `promptOrder` | System-prompt section order; `1200` in the supplied patch |
-| `reviewGate` | Turn-end source-write reminder; enabled by default |
+| `reviewGate` | Turn-end source-write reminder for executor subagents; enabled by default |
 | `strictModel` | Reject model mismatches when enabled; disabled by default |
+| `plainLanguage` | Mirror the user's current wording and avoid project jargon; enabled by default |
+| `styleSample` | Optional model answer the Agent should follow |
+| `glossary` | Optional `term=plain meaning` lines, one per line |
 
 Children inherit the parent's model provider. No API key belongs in this plugin's configuration. Finance also makes model calls when triggered, so total savings are not guaranteed.
 
